@@ -1,0 +1,35 @@
+name: Build exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: pip install pymupdf pyinstaller
+
+      - name: Download ffmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ff.zip
+          Expand-Archive ff.zip -DestinationPath ff
+          $exe = Get-ChildItem ff -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $exe.FullName .\ffmpeg.exe
+
+      - name: Build
+        run: pyinstaller --onefile --noconsole --name LectureVideoMaker --add-binary "ffmpeg.exe;." app.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LectureVideoMaker
+          path: dist/LectureVideoMaker.exe
