@@ -16,7 +16,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python packages
-        run: pip install pymupdf pyinstaller
+        run: run: pip install pymupdf==1.24.14 pyinstaller
 
       - name: Download ffmpeg
         shell: pwsh
