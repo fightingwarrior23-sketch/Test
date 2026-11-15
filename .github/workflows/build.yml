@@ -25,9 +25,11 @@ jobs:
           Expand-Archive ff.zip -DestinationPath ff
           $exe = Get-ChildItem ff -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           Copy-Item $exe.FullName .\ffmpeg.exe
+          $play = Get-ChildItem ff -Recurse -Filter ffplay.exe | Select-Object -First 1
+          Copy-Item $play.FullName .\ffplay.exe
 
       - name: Build
-        run: pyinstaller --onefile --noconsole --name LectureVideoMaker --add-binary "ffmpeg.exe;." app.py
+        run: pyinstaller --onefile --noconsole --name LectureVideoMaker --add-binary "ffmpeg.exe;." --add-binary "ffplay.exe;." app.py
 
       - uses: actions/upload-artifact@v4
         with:
