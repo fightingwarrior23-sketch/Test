@@ -92,6 +92,36 @@ def parse_bulk(text, doc, start, pt):
     return out
 
 
+LABEL_ONLY = re.compile(r"^\s*([A-Z]{1,3})(\d+)\s*:?\s*$", re.I)
+
+
+def read_sheet(ws, pt):
+    """Label cell ('A5') with its time in the cell to the right; B-labels sit after A's time
+    column. A time with its label in one cell ('A5:  13:30') still works."""
+    found, used = {}, set()
+    for row in ws.iter_rows():
+        for cell in row:
+            if (cell.row, cell.column) in used or cell.value is None:
+                continue
+            m = LABEL_ONLY.match(cell.value) if isinstance(cell.value, str) else None
+            try:
+                if m:
+                    d, pg = col_index(m[1]), int(m[2]) - 1
+                    tv = ws.cell(row=cell.row, column=cell.column + 1).value
+                    if isinstance(tv, str) and (CELL.match(tv) or LABEL_ONLY.match(tv)):
+                        tv = None          # that is the next label, not a time
+                    else:
+                        used.add((cell.row, cell.column + 1))
+                    ts = parse_cell(tv, (d, pg), pt)[2]
+                else:
+                    d, pg, ts = parse_cell(cell.value, (cell.column - 1, cell.row - 1), pt)
+            except ValueError:
+                raise ValueError(f"Cell {cell.coordinate}: cannot read '{cell.value}'.")
+            if ts:
+                found[(d, pg)] = ts
+    return found
+
+
 def find_ffplay():
     local = os.path.join(base_dir(), "ffplay.exe")
     return local if os.path.exists(local) else shutil.which("ffplay")
@@ -1032,14 +1062,15 @@ class App:
         wb = Workbook()
         ws = wb.active
         ws.title = "Times"
-        for c in range(1, n + 1):
-            ws.column_dimensions[get_column_letter(c)].width = 22
+        for k in range(1, n + 1):          # PDF A = columns A+B, PDF B = columns C+D, ...
+            ws.column_dimensions[get_column_letter(2 * k - 1)].width = 8
+            ws.column_dimensions[get_column_letter(2 * k)].width = 14
             for r in range(1, rows + 1):
-                cell = ws.cell(row=r, column=c, value=f"{get_column_letter(c)}{r}:  ")
-                cell.number_format = "@"   # text, so Excel never turns 13:30 into a clock time
+                ws.cell(row=r, column=2 * k - 1, value=f"{get_column_letter(k)}{r}").number_format = "@"
+                ws.cell(row=r, column=2 * k).number_format = "@"   # text: 13:30 stays 13:30
         wb.save(path)
-        messagebox.showinfo("Template saved", f"Saved:\n{path}\n\nType each time after the label "
-                            "(or over the whole cell). Empty cells are ignored.")
+        messagebox.showinfo("Template saved", f"Saved:\n{path}\n\nType each time in the empty cell next to its label. "
+                            "Slides without a time are ignored.")
 
     def import_table(self):
         if self.busy or not self.docs:
@@ -1050,16 +1081,10 @@ class App:
         from openpyxl import load_workbook
         if self.cur:
             self.commit(self.cur, False)
-        found = {}
-        for row in load_workbook(path, data_only=True).active.iter_rows():
-            for cell in row:
-                try:
-                    d, pg, ts = parse_cell(cell.value, (cell.column - 1, cell.row - 1), self.pt)
-                except ValueError:
-                    return messagebox.showerror(
-                        "Bad time", f"Cell {cell.coordinate}: cannot read '{cell.value}'.")
-                if ts:
-                    found[(d, pg)] = ts
+        try:
+            found = read_sheet(load_workbook(path, data_only=True).active, self.pt)
+        except ValueError as e:
+            return messagebox.showerror("Bad time", str(e))
         self.place_times(found)
 
     def bulk_import(self):
