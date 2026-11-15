@@ -41,17 +41,43 @@ def find_ffmpeg():
     return shutil.which("ffmpeg")
 
 
-def parse_time(text):
-    """'90' -> 90s, '1:30' -> 90s, '1:02:03' -> 3723s. Returns None if empty."""
+def find_ffplay():
+    local = os.path.join(base_dir(), "ffplay.exe")
+    return local if os.path.exists(local) else shutil.which("ffplay")
+
+
+def play_video(path, start=None, end=None):
+    """Open ffplay (part of ffmpeg, open source) on a video, optionally a time range."""
+    ffplay = find_ffplay()
+    if not ffplay:
+        return messagebox.showerror("ffplay missing", "ffplay.exe not found (should be bundled).")
+    if not path or not os.path.exists(path):
+        return messagebox.showwarning("Player", "Pick an existing video first.")
+    cmd = [ffplay, "-autoexit", "-window_title", os.path.basename(path)]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    if end is not None:
+        cmd += ["-t", f"{max(end - (start or 0), 0.1):.3f}"]
+    subprocess.Popen(cmd + [path], creationflags=NOWIN)
+
+
+def parse_time(text, hour=None):
+    """'90' -> 90s, '1:30' -> 90s, '1:02:03' -> 3723s, '59:' -> 59m 0s.
+    With hour=1: '59:' -> 1:59:00, '59:30' -> 1:59:30. Returns None if empty."""
     text = text.strip()
     if not text:
         return None
     parts = text.split(":")
     if len(parts) > 3:
         raise ValueError(text)
+    nums = [float(p) if p.strip() else 0.0 for p in parts]
+    if hour is not None and len(nums) < 3:
+        nums = ([float(hour), 0.0] if len(nums) == 1 else [float(hour)]) + nums
+    if len(nums) > 1 and nums[-1] >= 60 or len(nums) == 3 and nums[1] >= 60:
+        raise ValueError(text)
     total = 0.0
-    for p in parts:
-        total = total * 60 + float(p)
+    for n in nums:
+        total = total * 60 + n
     return total
 
 
@@ -120,6 +146,34 @@ def build_cut_filter(vf, keep):
     return ";".join(parts)
 
 
+def build_video_cut_filter(keep):
+    parts = []
+    for i, (a, b) in enumerate(keep):
+        end = f":end={b:.3f}" if b is not None else ""
+        parts.append(f"[0:v]trim=start={a:.3f}{end},setpts=PTS-STARTPTS[v{i}]")
+        parts.append(f"[0:a]atrim=start={a:.3f}{end},asetpts=PTS-STARTPTS[a{i}]")
+    parts.append("".join(f"[v{i}][a{i}]" for i in range(len(keep)))
+                 + f"concat=n={len(keep)}:v=1:a=1[v][a]")
+    return ";".join(parts)
+
+
+def run_ffmpeg(cmd, total, tick):
+    cmd = cmd[:-1] + ["-progress", "pipe:1", "-nostats", cmd[-1]]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, errors="replace", creationflags=NOWIN)
+    tail = []
+    for line in proc.stdout:
+        tail = (tail + [line.rstrip()])[-20:]
+        m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
+        if m and total:
+            tick(min(int(m.group(1)) / 1e6 / total * 100, 100))
+    proc.wait()
+    return proc.returncode == 0, "\n".join(tail)
+
+
+VIDEO_TYPES = [("Video", "*.mp4 *.mkv *.mov *.avi *.webm"), ("All", "*.*")]
+
+
 # -------------------------------------------------------------------- app
 class App:
     def __init__(self, root):
@@ -133,6 +187,8 @@ class App:
         self.crf = tk.StringVar(value="30")
         self.multi = tk.BooleanVar(value=False)
         self.cut_on = tk.BooleanVar(value=False)
+        self.hour_on = tk.BooleanVar(value=False)
+        self.hour = tk.StringVar(value="1")
 
         self.docs = []       # [{"path": str, "doc": fitz.Document}]
         self.times = {}      # (doc index, page index) -> sorted list of seconds
@@ -157,6 +213,15 @@ class App:
         tools.add_checkbutton(label="Multiple PDFs", variable=self.multi,
                               command=self.toggle_multi)
         bar.add_cascade(label="Additional tools", menu=tools)
+        tm = tk.Menu(bar, tearoff=0)
+        tm.add_command(label="Bulk import times…", command=self.bulk_import)
+        tm.add_command(label="Shift times…", command=self.shift_dialog)
+        bar.add_cascade(label="Times", menu=tm)
+        vm = tk.Menu(bar, tearoff=0)
+        vm.add_command(label="Merge videos…", command=self.merge_dialog)
+        vm.add_command(label="Video editor…", command=self.editor_dialog)
+        vm.add_command(label="Play video…", command=self.play_dialog)
+        bar.add_cascade(label="Video tools", menu=vm)
         self.root.config(menu=bar)
 
     def build_top(self):
@@ -204,6 +269,11 @@ class App:
                    command=lambda: self.add_row(focus=True)).pack(side="left")
         ttk.Button(btns, text="Save & next ↵", command=self.set_time).pack(side="left", padx=8)
         ttk.Label(self.edit_box, text="Leave empty to skip this page.").pack(anchor="w", pady=(4, 0))
+        hr = ttk.Frame(self.edit_box)
+        hr.pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(hr, text="Default hour:", variable=self.hour_on).pack(side="left")
+        ttk.Entry(hr, textvariable=self.hour, width=3).pack(side="left", padx=4)
+        ttk.Label(hr, text="(type only m:ss; 59: = 59 min 0 s)").pack(side="left")
 
         opts = ttk.Frame(right)
         opts.pack(side="bottom", fill="x")
@@ -544,10 +614,11 @@ class App:
     def commit(self, key, loud):
         """Store the entries' times for `key` = (pdf, page). False on bad input."""
         try:
-            ts = sorted({parse_time(e.get()) for e in self.rows} - {None})
+            ts = sorted({self.pt(e.get()) for e in self.rows} - {None})
         except ValueError:
             if loud:
-                messagebox.showerror("Bad time", "Use m:ss, h:mm:ss or plain seconds.")
+                messagebox.showerror("Bad time", "Use m:ss, h:mm:ss or plain seconds.\n"
+                                 "Seconds and minutes after a colon must be under 60.")
             return False
         if ts:
             self.times[key] = ts
@@ -590,6 +661,299 @@ class App:
             return
         if r + 1 < len(self.docs[c]["doc"]):  # next page of the same PDF
             self.select_cell(c, r + 1)
+
+    # ------------------------------------------------- video merger / editor
+    def tool_window(self, title):
+        ff = find_ffmpeg()
+        if not ff:
+            messagebox.showerror("ffmpeg missing", "ffmpeg.exe not found (should be bundled).")
+            return None, None, None
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        f = ttk.Frame(win, padding=8)
+        f.pack(fill="both", expand=True)
+        return ff, win, f
+
+    def path_row(self, f, label, var, cmd):
+        r = ttk.Frame(f)
+        r.pack(fill="x", pady=2)
+        ttk.Label(r, text=label, width=7).pack(side="left")
+        ttk.Entry(r, textvariable=var).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(r, text="Browse…", command=cmd).pack(side="left")
+
+    def run_job(self, win, f, cmd, total, out):
+        bar = ttk.Progressbar(f, maximum=100)
+        bar.pack(fill="x", pady=4)
+        st = ttk.Label(f, text="Working…")
+        st.pack(anchor="w")
+
+        def run():
+            ok, tail = run_ffmpeg(cmd, total, lambda p: win.after(0, lambda: bar.config(value=p)))
+
+            def fin():
+                st.config(text="Finished" if ok else "Failed")
+                if ok:
+                    messagebox.showinfo("Done", f"Saved:\n{out}", parent=win)
+                else:
+                    messagebox.showerror("Error", "ffmpeg failed:\n" + tail, parent=win)
+            win.after(0, fin)
+        threading.Thread(target=run, daemon=True).start()
+
+    def merge_dialog(self):
+        ff, win, f = self.tool_window("Merge videos")
+        if not ff:
+            return
+        ttk.Label(f, text="Videos are joined in this order (all must have sound).").pack(anchor="w")
+        lb = tk.Listbox(f, width=70, height=8)
+        lb.pack(fill="x", pady=4)
+        row = ttk.Frame(f)
+        row.pack(anchor="w")
+        out = tk.StringVar()
+
+        def add():
+            for p in filedialog.askopenfilenames(parent=win, filetypes=VIDEO_TYPES):
+                lb.insert("end", p)
+                if not out.get():
+                    out.set(os.path.splitext(p)[0] + "_merged.mp4")
+
+        def rem():
+            for i in reversed(lb.curselection()):
+                lb.delete(i)
+
+        def move(d):
+            sel = lb.curselection()
+            if sel and 0 <= sel[0] + d < lb.size():
+                i = sel[0]
+                t = lb.get(i)
+                lb.delete(i)
+                lb.insert(i + d, t)
+                lb.selection_set(i + d)
+        for t, c in (("Add…", add), ("Remove", rem),
+                     ("Up", lambda: move(-1)), ("Down", lambda: move(1))):
+            ttk.Button(row, text=t, command=c).pack(side="left", padx=2)
+        self.path_row(f, "Output", out, lambda: out.set(filedialog.asksaveasfilename(
+            parent=win, defaultextension=".mp4", filetypes=[("MP4", "*.mp4")]) or out.get()))
+
+        def go():
+            files = list(lb.get(0, "end"))
+            if len(files) < 2 or not out.get():
+                return messagebox.showwarning("Merge", "Add two or more videos and an output file.",
+                                              parent=win)
+            n = len(files)
+            fc = "".join(f"[{i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+                         f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{i}];"
+                         f"[{i}:a]aresample=44100[a{i}];" for i in range(n))
+            fc += "".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[v][a]"
+            cmd = ([ff, "-y"] + [a for p in files for a in ("-i", p)] +
+                   ["-filter_complex", fc, "-map", "[v]", "-map", "[a]", "-c:v", "libx264",
+                    "-crf", "23", "-c:a", "aac", out.get()])
+            self.run_job(win, f, cmd, sum(audio_duration(ff, x) or 0 for x in files), out.get())
+        ttk.Button(f, text="Merge", command=go).pack(anchor="e", pady=4)
+
+    def editor_dialog(self):
+        ff, win, f = self.tool_window("Video editor")
+        if not ff:
+            return
+        o = self.out.get()
+        src = tk.StringVar(value=o if o and os.path.exists(o) else "")
+        dst = tk.StringVar(value=os.path.splitext(src.get())[0] + "_edited.mp4" if src.get() else "")
+        at, cuts, ref = tk.StringVar(value="0"), [], [None]
+        img = ttk.Label(f, anchor="center", width=60)
+
+        def show(_=None):
+            try:
+                sec = parse_time(at.get()) or 0
+            except ValueError:
+                return
+            png = os.path.join(tempfile.gettempdir(), "lecvid_prev.png")
+            subprocess.run([ff, "-y", "-ss", str(sec), "-i", src.get(), "-frames:v", "1",
+                            "-vf", "scale=480:-1", png], capture_output=True, creationflags=NOWIN)
+            if os.path.exists(png):
+                ref[0] = tk.PhotoImage(file=png)
+                img.config(image=ref[0])
+
+        def pick():
+            p = filedialog.askopenfilename(parent=win, filetypes=VIDEO_TYPES)
+            if p:
+                src.set(p)
+                dst.set(os.path.splitext(p)[0] + "_edited.mp4")
+                show()
+        self.path_row(f, "Video", src, pick)
+        self.path_row(f, "Save as", dst, lambda: dst.set(filedialog.asksaveasfilename(
+            parent=win, defaultextension=".mp4", filetypes=[("MP4", "*.mp4")]) or dst.get()))
+        img.pack(pady=4)
+        r = ttk.Frame(f)
+        r.pack(anchor="w")
+        ttk.Label(r, text="Preview frame at").pack(side="left")
+        e = ttk.Entry(r, textvariable=at, width=9)
+        e.pack(side="left", padx=4)
+        e.bind("<Return>", show)
+        ttk.Button(r, text="Show", command=show).pack(side="left")
+
+        def tm(var):
+            try:
+                return parse_time(var.get())
+            except ValueError:
+                return None
+        ttk.Button(r, text="▶ Play from here", padx=6,
+                   command=lambda: play_video(src.get(), tm(at))).pack(side="left", padx=(12, 2))
+        ttk.Button(r, text="▶ Play removed part", padx=6,
+                   command=lambda: play_video(src.get(), tm(a_), tm(b_))).pack(side="left")
+        ttk.Label(f, text="Remove this part of the video:").pack(anchor="w", pady=(8, 0))
+        r2 = ttk.Frame(f)
+        r2.pack(anchor="w")
+        a_, b_ = tk.StringVar(), tk.StringVar()
+        ttk.Entry(r2, textvariable=a_, width=9).pack(side="left")
+        ttk.Button(r2, text="← frame time", command=lambda: a_.set(at.get())).pack(side="left", padx=2)
+        ttk.Entry(r2, textvariable=b_, width=9).pack(side="left", padx=(8, 0))
+        ttk.Button(r2, text="← frame time", command=lambda: b_.set(at.get())).pack(side="left", padx=2)
+        lb = tk.Listbox(f, height=4)
+
+        def add_cut():
+            try:
+                a, b = parse_time(a_.get()), parse_time(b_.get())
+            except ValueError:
+                a = b = None
+            if a is None or b is None or b <= a:
+                return messagebox.showerror("Cut", "Enter 'from' and a later 'to' (m:ss or h:mm:ss).",
+                                            parent=win)
+            cuts.append((a, b))
+            lb.insert("end", f"{fmt_time(a)} – {fmt_time(b)}")
+
+        def del_cut():
+            for i in reversed(lb.curselection()):
+                lb.delete(i)
+                del cuts[i]
+        ttk.Button(r2, text="Add", command=add_cut).pack(side="left", padx=8)
+        lb.pack(fill="x", pady=4)
+        ttk.Button(f, text="Delete selected", command=del_cut).pack(anchor="w")
+
+        def go():
+            if not src.get() or not dst.get() or not cuts:
+                return messagebox.showwarning("Editor", "Pick a video, an output, and add a part to remove.",
+                                              parent=win)
+            total = audio_duration(ff, src.get())
+            cs = merge_cuts(cuts)
+            keep = keep_segments(cs, total)
+            if not keep:
+                return messagebox.showerror("Editor", "Nothing would be left.", parent=win)
+            length = (total - sum(b - a for a, b in cs)) if total else None
+            cmd = [ff, "-y", "-i", src.get(), "-filter_complex", build_video_cut_filter(keep),
+                   "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-crf", "23", "-c:a", "aac", dst.get()]
+            self.run_job(win, f, cmd, length, dst.get())
+        ttk.Button(f, text="Export edited video", command=go).pack(anchor="e", pady=4)
+        if src.get():
+            show()
+
+    def play_dialog(self):
+        o = self.out.get()
+        p = filedialog.askopenfilename(
+            filetypes=VIDEO_TYPES, initialfile=os.path.basename(o) if o and os.path.exists(o) else "",
+            initialdir=os.path.dirname(o) if o else None)
+        if p:
+            play_video(p)
+
+    # ------------------------------------------------- bulk import / shift
+    def pt(self, text):
+        try:
+            h = int(self.hour.get()) if self.hour_on.get() else None
+        except ValueError:
+            h = None
+        return parse_time(text, h)
+
+    def refresh_edit(self):
+        self.redraw_grid()
+        if self.cur:
+            self.build_rows(self.times.get(self.cur))
+
+    def bulk_import(self):
+        if self.busy or not self.docs:
+            return messagebox.showinfo("Bulk import", "Open a PDF first.")
+        if self.cur:
+            self.commit(self.cur, False)
+        c, r0 = self.cur or (0, 0)
+        win = tk.Toplevel(self.root)
+        win.title("Bulk import times")
+        win.transient(self.root)
+        ttk.Label(win, justify="left", text=(
+            f"One line per page, starting at page {r0 + 1}.\n"
+            "Several times for one page: separate with commas.\n"
+            "Empty line = leave that page as it is.")).pack(anchor="w", padx=8, pady=6)
+        box = tk.Text(win, width=40, height=16)
+        box.pack(padx=8)
+        box.focus_set()
+
+        def apply():
+            lines = box.get("1.0", "end").split("\n")
+            while lines and not lines[-1].strip():
+                lines.pop()
+            n = len(self.docs[c]["doc"]) - r0
+            new = {}
+            for i, line in enumerate(lines[:n]):
+                try:
+                    ts = sorted({self.pt(x) for x in line.split(",")} - {None})
+                except ValueError:
+                    return messagebox.showerror(
+                        "Bad time", f"Line {i + 1}: cannot read '{line}'.", parent=win)
+                if ts:
+                    new[(c, r0 + i)] = ts
+            self.times.update(new)
+            self.refresh_edit()
+            win.destroy()
+            extra = len(lines) - n
+            self.status.config(text=f"Imported {len(new)} pages"
+                               + (f" ({extra} extra lines ignored)" if extra > 0 else ""))
+        ttk.Button(win, text="Import", command=apply).pack(pady=8)
+
+    def apply_shift(self, c, start, count, by, push):
+        col = {r: v for (d, r), v in self.times.items() if d == c}
+        n = len(self.docs[c]["doc"])
+        moving = {r for r in col if r >= start and (push or r < start + count)}
+        new = {r: v for r, v in col.items() if r not in moving}
+        for r in moving:           # moved cells overwrite whatever they land on
+            if r + by < n:         # pushed past the last page: timing is dropped
+                new[r + by] = col[r]
+        for k in [k for k in self.times if k[0] == c]:
+            del self.times[k]
+        for r, v in new.items():
+            self.times[(c, r)] = v
+
+    def shift_dialog(self):
+        if self.busy or not self.docs:
+            return messagebox.showinfo("Shift times", "Open a PDF first.")
+        if self.cur:
+            self.commit(self.cur, False)
+        c, r0 = self.cur or (0, 0)
+        win = tk.Toplevel(self.root)
+        win.title("Shift times" + (f" (PDF {c + 1})" if self.multi.get() else ""))
+        win.transient(self.root)
+        f = ttk.Frame(win, padding=10)
+        f.pack()
+        vals = []
+        for i, (lab, v) in enumerate([("From page", r0 + 1), ("How many pages", 1),
+                                      ("Shift down by", 1)]):
+            ttk.Label(f, text=lab).grid(row=i, column=0, sticky="w", pady=2)
+            var = tk.StringVar(value=str(v))
+            ttk.Entry(f, textvariable=var, width=6).grid(row=i, column=1, padx=6)
+            vals.append(var)
+        mode = tk.StringVar(value="push")
+        ttk.Radiobutton(f, text="Push everything below along (ignores 'How many')",
+                        variable=mode, value="push").grid(row=3, columnspan=2, sticky="w")
+        ttk.Radiobutton(f, text="Overwrite what is below",
+                        variable=mode, value="over").grid(row=4, columnspan=2, sticky="w")
+
+        def apply():
+            try:
+                s, k, by = (int(v.get()) for v in vals)
+                if min(s, k, by) < 1:
+                    raise ValueError
+            except ValueError:
+                return messagebox.showerror("Shift", "Use whole numbers, 1 or more.", parent=win)
+            self.apply_shift(c, s - 1, k, by, mode.get() == "push")
+            self.refresh_edit()
+            win.destroy()
+        ttk.Button(f, text="Shift", command=apply).grid(row=5, columnspan=2, pady=8)
 
     # ----------------------------------------------------------- export
     def name_of(self, d, p):
