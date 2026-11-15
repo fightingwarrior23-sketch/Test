@@ -10,6 +10,7 @@ PDF slides + audio + start times  ->  MP4 video (ffmpeg bundled).
 Requires: pip install pymupdf
 """
 import base64
+import datetime as dt
 import os
 import re
 import shutil
@@ -18,7 +19,7 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import fitz  # PyMuPDF
 
@@ -39,6 +40,56 @@ def find_ffmpeg():
     if os.path.exists(local):
         return local
     return shutil.which("ffmpeg")
+
+
+CELL = re.compile(r"^\s*(?:L(\d+)S(\d+)|([A-Z]{1,3})(\d+))\s*[:=.)-]\s*(.*)$", re.I)
+
+
+def col_index(letters):
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def col_letter(i):
+    s = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def parse_cell(v, pos, pt):
+    """A cell or line -> (pdf, page, [seconds]). 'B3: 13:30' = PDF B (2nd), slide 3;
+    'L2S3:' also works. Without a label, `pos` = (pdf, page) 0-based is used."""
+    if isinstance(v, dt.time):          # Excel turned it into a clock time
+        return pos[0], pos[1], [v.hour * 3600 + v.minute * 60 + v.second]
+    if isinstance(v, dt.timedelta):
+        return pos[0], pos[1], [v.total_seconds()]
+    text = "" if v is None else str(v)
+    m = CELL.match(text)
+    if m:
+        d, pg = (int(m[1]) - 1, int(m[2]) - 1) if m[1] else (col_index(m[3]), int(m[4]) - 1)
+        body = m[5]
+    else:
+        d, pg, body = pos[0], pos[1], text
+    return d, pg, sorted({pt(x) for x in body.split(",")} - {None})
+
+
+def parse_bulk(text, doc, start, pt):
+    """Pasted lines: 'A5: 13:30' or plain '13:30' (next page of `doc`, from `start`)."""
+    out, page = {}, start
+    for i, line in enumerate(text.split("\n")):
+        try:
+            d, pg, ts = parse_cell(line, (doc, page), pt)
+        except ValueError:
+            raise ValueError(f"Line {i + 1}: cannot read '{line.strip()}'.")
+        page = pg + 1
+        if ts:
+            out[(d, pg)] = ts
+    return out
 
 
 def find_ffplay():
@@ -197,8 +248,11 @@ class App:
         self.cuts = []       # [(frame, from_entry, to_entry)]
         self.thumb = None
         self.busy = False
+        self.records = [self.new_rec()]   # one per recording; each has its own 0:00
+        self.rec_i = 0
 
         self.build_menu()
+        self.build_tabs()
         self.build_top()
         self.build_cut_panel()
         self.build_main()
@@ -216,6 +270,9 @@ class App:
         tm = tk.Menu(bar, tearoff=0)
         tm.add_command(label="Bulk import times…", command=self.bulk_import)
         tm.add_command(label="Shift times…", command=self.shift_dialog)
+        tm.add_separator()
+        tm.add_command(label="Export time table template…", command=self.export_template)
+        tm.add_command(label="Import time table (Excel)…", command=self.import_table)
         bar.add_cascade(label="Times", menu=tm)
         vm = tk.Menu(bar, tearoff=0)
         vm.add_command(label="Merge videos…", command=self.merge_dialog)
@@ -396,7 +453,7 @@ class App:
             x = i * COLW
             name = os.path.basename(d["path"])
             if self.multi.get():
-                name = f"{i + 1}. {name}"
+                name = f"{col_letter(i)}. {name}"
             if len(name) > maxc:
                 name = name[:maxc - 1] + "…"
             self.head.create_rectangle(x, 0, x + COLW, HEADH, fill=HEADBG, outline=GRID)
@@ -545,7 +602,7 @@ class App:
         else:
             self.cut_frame.pack_forget()
 
-    def add_cut(self):
+    def add_cut(self, a="", b="", focus=True):
         f = ttk.Frame(self.cut_rows)
         ttk.Label(f, text="from").pack(side="left")
         ea = ttk.Entry(f, width=9)
@@ -553,10 +610,13 @@ class App:
         ttk.Label(f, text="to").pack(side="left")
         eb = ttk.Entry(f, width=9)
         eb.pack(side="left", padx=3)
+        ea.insert(0, a)
+        eb.insert(0, b)
         ttk.Button(f, text="×", width=2, command=lambda: self.del_cut(f)).pack(side="left", padx=3)
         self.cuts.append((f, ea, eb))
         self.regrid_cuts()
-        ea.focus_set()
+        if focus:
+            ea.focus_set()
 
     def del_cut(self, frame):
         self.cuts = [c for c in self.cuts if c[0] is not frame]
@@ -567,11 +627,11 @@ class App:
         for i, (f, _, _) in enumerate(self.cuts):
             f.grid(row=i // 3, column=i % 3, padx=8, pady=2, sticky="w")
 
-    def read_cuts(self):
+    def read_cuts(self, pairs):
         out = []
-        for _, ea, eb in self.cuts:
+        for ta, tb in pairs:
             try:
-                a, b = parse_time(ea.get()), parse_time(eb.get())
+                a, b = parse_time(ta), parse_time(tb)
             except ValueError:
                 raise ValueError("A cut has a time I can't read. Use m:ss or h:mm:ss.")
             if a is None and b is None:
@@ -648,7 +708,7 @@ class App:
         self.thumb = tk.PhotoImage(data=base64.b64encode(png))
         self.preview.config(image=self.thumb)
 
-        who = f"PDF {c + 1} · page {r + 1}" if self.multi.get() else f"Page {r + 1}"
+        who = f"PDF {col_letter(c)} · page {r + 1}" if self.multi.get() else f"Page {r + 1}"
         self.edit_box.config(text=f"{who} appears at (m:ss or h:mm:ss)")
         self.build_rows(self.times.get((c, r)))
         self.ensure_visible(c, r)
@@ -661,6 +721,85 @@ class App:
             return
         if r + 1 < len(self.docs[c]["doc"]):  # next page of the same PDF
             self.select_cell(c, r + 1)
+
+    # ------------------------------------------------------------ records
+    def new_rec(self):
+        return {"docs": [], "times": {}, "cur": None, "audio": "", "cut_on": False, "cuts": []}
+
+    def build_tabs(self):
+        bar = ttk.Frame(self.root, padding=(8, 6, 8, 0))
+        bar.pack(fill="x")
+        self.tabs = ttk.Notebook(bar, height=1)
+        self.tabs.add(tk.Frame(self.tabs), text="Record 1")
+        self.tabs.pack(side="left")
+        self.tabs.bind("<<NotebookTabChanged>>", self.on_tab)
+        ttk.Button(bar, text="+ Add record", command=self.add_record).pack(side="left", padx=8)
+        ttk.Button(bar, text="Remove this record", command=self.del_record).pack(side="left")
+        ttk.Label(bar, text="Each record = one recording with its own PDFs, audio and 0:00."
+                  ).pack(side="left", padx=12)
+
+    def snap(self):
+        if self.cur:
+            self.commit(self.cur, False)
+        return {"docs": self.docs, "times": self.times, "cur": self.cur,
+                "audio": self.audio.get(), "cut_on": self.cut_on.get(),
+                "cuts": [(ea.get(), eb.get()) for _, ea, eb in self.cuts]}
+
+    def load(self, rec):
+        self.docs, self.times, self.cur = rec["docs"], rec["times"], None
+        self.audio.set(rec["audio"])
+        for f, _, _ in self.cuts:
+            f.destroy()
+        self.cuts = []
+        for a, b in rec["cuts"]:
+            self.add_cut(a, b, focus=False)
+        self.cut_on.set(rec["cut_on"])
+        self.toggle_cut()
+        self.refresh_pdf_label()
+        self.redraw_grid()
+        if self.docs:
+            self.select_cell(*(rec["cur"] or (0, 0)))
+        else:
+            self.preview.config(image="")
+            self.thumb = None
+            self.status.config(text="Pick a PDF to start")
+            self.edit_box.config(text="Select a page")
+            self.build_rows(None)
+
+    def on_tab(self, _=None):
+        j = self.tabs.index("current")
+        if j == self.rec_i:
+            return
+        if self.busy:
+            return self.tabs.select(self.rec_i)
+        self.records[self.rec_i] = self.snap()
+        self.rec_i = j
+        self.load(self.records[j])
+
+    def add_record(self):
+        if self.busy:
+            return
+        self.records[self.rec_i] = self.snap()
+        self.records.append(self.new_rec())
+        self.tabs.add(tk.Frame(self.tabs), text=f"Record {len(self.records)}")
+        self.tabs.select(len(self.records) - 1)
+
+    def del_record(self):
+        if self.busy or len(self.records) < 2:
+            return
+        if not messagebox.askyesno("Remove record",
+                                   f"Remove Record {self.rec_i + 1} and all its times?"):
+            return
+        for d in self.docs:
+            d["doc"].close()
+        i = self.rec_i
+        self.records.pop(i)
+        self.tabs.forget(i)
+        self.rec_i = min(i, len(self.records) - 1)
+        for k in range(len(self.records)):
+            self.tabs.tab(k, text=f"Record {k + 1}")
+        self.tabs.select(self.rec_i)
+        self.load(self.records[self.rec_i])
 
     # ------------------------------------------------- video merger / editor
     def tool_window(self, title):
@@ -867,6 +1006,62 @@ class App:
         if self.cur:
             self.build_rows(self.times.get(self.cur))
 
+    def place_times(self, found):
+        ok = {k: ts for k, ts in found.items() if 0 <= k[0] < len(self.docs)
+              and 0 <= k[1] < len(self.docs[k[0]]["doc"])}
+        self.times.update(ok)
+        self.refresh_edit()
+        gone = len(found) - len(ok)
+        self.status.config(text=f"Imported {len(ok)} slides"
+                           + (f" ({gone} outside the loaded PDFs ignored)" if gone else ""))
+
+    def export_template(self):
+        n = simpledialog.askinteger("Time table template", "How many PDFs?",
+                                    initialvalue=max(len(self.docs), 1), minvalue=1,
+                                    maxvalue=50, parent=self.root)
+        rows = n and simpledialog.askinteger("Time table template", "Slides per PDF?",
+                                             initialvalue=99, minvalue=1, maxvalue=999,
+                                             parent=self.root)
+        path = rows and filedialog.asksaveasfilename(
+            defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")],
+            initialfile="time_table_template.xlsx")
+        if not path:
+            return
+        from openpyxl import Workbook
+        from openpyxl.utils import get_column_letter
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Times"
+        for c in range(1, n + 1):
+            ws.column_dimensions[get_column_letter(c)].width = 22
+            for r in range(1, rows + 1):
+                cell = ws.cell(row=r, column=c, value=f"{get_column_letter(c)}{r}:  ")
+                cell.number_format = "@"   # text, so Excel never turns 13:30 into a clock time
+        wb.save(path)
+        messagebox.showinfo("Template saved", f"Saved:\n{path}\n\nType each time after the label "
+                            "(or over the whole cell). Empty cells are ignored.")
+
+    def import_table(self):
+        if self.busy or not self.docs:
+            return messagebox.showinfo("Import", "Open a PDF first.")
+        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
+        if not path:
+            return
+        from openpyxl import load_workbook
+        if self.cur:
+            self.commit(self.cur, False)
+        found = {}
+        for row in load_workbook(path, data_only=True).active.iter_rows():
+            for cell in row:
+                try:
+                    d, pg, ts = parse_cell(cell.value, (cell.column - 1, cell.row - 1), self.pt)
+                except ValueError:
+                    return messagebox.showerror(
+                        "Bad time", f"Cell {cell.coordinate}: cannot read '{cell.value}'.")
+                if ts:
+                    found[(d, pg)] = ts
+        self.place_times(found)
+
     def bulk_import(self):
         if self.busy or not self.docs:
             return messagebox.showinfo("Bulk import", "Open a PDF first.")
@@ -877,33 +1072,20 @@ class App:
         win.title("Bulk import times")
         win.transient(self.root)
         ttk.Label(win, justify="left", text=(
-            f"One line per page, starting at page {r0 + 1}.\n"
+            f"One line per page, starting at page {r0 + 1}, or label lines like B5: 13:30 (B = 2nd PDF).\n"
             "Several times for one page: separate with commas.\n"
-            "Empty line = leave that page as it is.")).pack(anchor="w", padx=8, pady=6)
+            "Empty line or empty label = leave that page as it is.")).pack(anchor="w", padx=8, pady=6)
         box = tk.Text(win, width=40, height=16)
         box.pack(padx=8)
         box.focus_set()
 
         def apply():
-            lines = box.get("1.0", "end").split("\n")
-            while lines and not lines[-1].strip():
-                lines.pop()
-            n = len(self.docs[c]["doc"]) - r0
-            new = {}
-            for i, line in enumerate(lines[:n]):
-                try:
-                    ts = sorted({self.pt(x) for x in line.split(",")} - {None})
-                except ValueError:
-                    return messagebox.showerror(
-                        "Bad time", f"Line {i + 1}: cannot read '{line}'.", parent=win)
-                if ts:
-                    new[(c, r0 + i)] = ts
-            self.times.update(new)
-            self.refresh_edit()
+            try:
+                found = parse_bulk(box.get("1.0", "end"), c, r0, self.pt)
+            except ValueError as e:
+                return messagebox.showerror("Bad time", str(e), parent=win)
             win.destroy()
-            extra = len(lines) - n
-            self.status.config(text=f"Imported {len(new)} pages"
-                               + (f" ({extra} extra lines ignored)" if extra > 0 else ""))
+            self.place_times(found)
         ttk.Button(win, text="Import", command=apply).pack(pady=8)
 
     def apply_shift(self, c, start, count, by, push):
@@ -926,7 +1108,7 @@ class App:
             self.commit(self.cur, False)
         c, r0 = self.cur or (0, 0)
         win = tk.Toplevel(self.root)
-        win.title("Shift times" + (f" (PDF {c + 1})" if self.multi.get() else ""))
+        win.title("Shift times" + (f" (PDF {col_letter(c)})" if self.multi.get() else ""))
         win.transient(self.root)
         f = ttk.Frame(win, padding=10)
         f.pack()
@@ -957,7 +1139,7 @@ class App:
 
     # ----------------------------------------------------------- export
     def name_of(self, d, p):
-        return f"PDF {d + 1} page {p + 1}" if self.multi.get() else f"Page {p + 1}"
+        return f"PDF {col_letter(d)} page {p + 1}" if self.multi.get() else f"Page {p + 1}"
 
     def start(self):
         if self.busy:
@@ -966,29 +1148,32 @@ class App:
         if not ffmpeg:
             messagebox.showerror("ffmpeg missing", "ffmpeg.exe not found (should be bundled).")
             return
-        if not self.docs or not self.audio.get() or not self.out.get():
-            messagebox.showwarning("Missing", "Pick a PDF, an audio file and an output file.")
+        if not self.out.get():
+            messagebox.showwarning("Missing", "Pick an output file.")
             return
         if self.cur is not None and not self.commit(self.cur, loud=True):
             return
-        cues = sorted((t, d, p) for (d, p), ts in self.times.items() for t in ts)
-        if not cues:
-            messagebox.showwarning("Missing", "Set at least one start time.")
-            return
-        for (a, da, pa), (b, db, pb) in zip(cues, cues[1:]):
-            if b <= a:
-                messagebox.showerror(
-                    "Same time",
-                    f"{self.name_of(da, pa)} and {self.name_of(db, pb)} "
-                    f"both start at {fmt_time(a)}.")
-                return
-        cuts = []
-        if self.cut_on.get():
-            try:
-                cuts = self.read_cuts()
-            except ValueError as e:
-                messagebox.showerror("Cut from audio", str(e))
-                return
+        self.records[self.rec_i] = self.snap()
+        jobs = []
+        for i, rec in enumerate(self.records):
+            tag = f"Record {i + 1}: " if len(self.records) > 1 else ""
+            if not rec["docs"] or not rec["audio"]:
+                return messagebox.showwarning("Missing", tag + "pick a PDF and an audio file.")
+            cues = sorted((t, d, p) for (d, p), ts in rec["times"].items() for t in ts)
+            if not cues:
+                return messagebox.showwarning("Missing", tag + "set at least one start time.")
+            for (a, da, pa), (b, db, pb) in zip(cues, cues[1:]):
+                if b <= a:
+                    return messagebox.showerror(
+                        "Same time", f"{tag}{self.name_of(da, pa)} and {self.name_of(db, pb)} "
+                        f"both start at {fmt_time(a)}.")
+            cuts = []
+            if rec["cut_on"]:
+                try:
+                    cuts = self.read_cuts(rec["cuts"])
+                except ValueError as e:
+                    return messagebox.showerror("Cut from audio", tag + str(e))
+            jobs.append((rec["docs"], rec["audio"], cues, cuts))
         try:
             fps = int(self.fps.get())
             crf = int(self.crf.get())
@@ -997,8 +1182,7 @@ class App:
             return
         self.busy = True
         self.go.config(state="disabled")
-        threading.Thread(target=self.work, args=(ffmpeg, cues, cuts, fps, crf),
-                         daemon=True).start()
+        threading.Thread(target=self.work, args=(ffmpeg, jobs, fps, crf), daemon=True).start()
 
     def ui(self, text=None, pct=None, done=None):
         def f():
@@ -1013,75 +1197,83 @@ class App:
                     "Done" if done[0] else "Error", done[1])
         self.root.after(0, f)
 
-    def work(self, ffmpeg, cues, cuts, fps, crf):
+    def render(self, ffmpeg, job, tmp, dest, label, fps, crf, base, span):
+        docs, audio, cues, cuts = job
+        total = audio_duration(ffmpeg, audio)
+        if total:
+            cuts = [(a, min(b, total)) for a, b in cuts if a < total]
+        length = total
+        if cuts:
+            if total:
+                length = total - sum(b - a for a, b in cuts)
+                if length < 0.5:
+                    raise ValueError(label + "Nothing is left of the audio after the cuts.")
+            mapped = {}
+            for t, d, p in cues:  # a later slide wins if two land on the same time
+                mapped[round(remap_time(t, cuts), 3)] = (d, p)
+            cues = [(t, d, p) for t, (d, p) in sorted(mapped.items())]
+        paths = {}
+        for d, p in sorted({(d, p) for _, d, p in cues}):
+            self.ui(f"{label}Rendering {self.name_of(d, p)}…", base)
+            paths[(d, p)] = os.path.join(tmp, f"{d + 1}_{p + 1}.png")
+            render_page(docs[d]["doc"], p, paths[(d, p)])
+        files = [paths[(d, p)] for _, d, p in cues]
+        starts = [0.0] + [t for t, _, _ in cues[1:]]   # first slide always starts at 0
+        durs = [b - a for a, b in zip(starts, starts[1:])]
+        durs.append(max(length - starts[-1], 1) if length else 36000)
+        lst = os.path.join(tmp, "list.txt")
+        with open(lst, "w", encoding="utf-8") as f:
+            for p_, d_ in zip(files, durs):
+                f.write(f"file '{p_.replace(os.sep, '/')}'\nduration {d_:.3f}\n")
+            f.write(f"file '{files[-1].replace(os.sep, '/')}'\n")  # concat quirk
+        vf = (f"fps={fps},scale=1920:1080:force_original_aspect_ratio=decrease,"
+              "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
+        if cuts:
+            keep = keep_segments(cuts, total)
+            if not keep:
+                raise ValueError(label + "Nothing is left of the audio after the cuts.")
+            maps = ["-filter_complex", build_cut_filter(vf, keep), "-map", "[v]", "-map", "[aout]"]
+        else:
+            maps = ["-vf", vf]
+        cmd = ([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-i", audio] + maps +
+               ["-c:v", "libx264", "-tune", "stillimage", "-crf", str(crf),
+                "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2", "-shortest",
+                "-progress", "pipe:1", "-nostats", dest])
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace", creationflags=NOWIN)
+        tail = []
+        for line in proc.stdout:
+            tail = (tail + [line.rstrip()])[-25:]
+            m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
+            if m and length:
+                sec = int(m.group(1)) / 1e6
+                self.ui(f"{label}Encoding {fmt_time(sec)} / {fmt_time(length)}",
+                        base + min(sec / length, 1) * span)
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError("ffmpeg failed:\n" + "\n".join(tail))
+
+    def work(self, ffmpeg, jobs, fps, crf):
         tmp = tempfile.mkdtemp(prefix="lecvid_")
         try:
-            audio = self.audio.get()
-            total = audio_duration(ffmpeg, audio)
-
-            # cuts: clip to the audio, move every start time to the shortened audio
-            if total:
-                cuts = [(a, min(b, total)) for a, b in cuts if a < total]
-            length = total
-            if cuts:
-                if total:
-                    length = total - sum(b - a for a, b in cuts)
-                    if length < 0.5:
-                        raise ValueError("Nothing is left of the audio after the cuts.")
-                mapped = {}
-                for t, d, p in cues:  # a later slide wins if two land on the same time
-                    mapped[round(remap_time(t, cuts), 3)] = (d, p)
-                cues = [(t, d, p) for t, (d, p) in sorted(mapped.items())]
-
-            # 1) extract each used page once, as an HD image
-            paths = {}
-            for d, p in sorted({(d, p) for _, d, p in cues}):
-                self.ui(f"Rendering {self.name_of(d, p)}…", 0)
-                paths[(d, p)] = os.path.join(tmp, f"{d + 1}_{p + 1}.png")
-                render_page(self.docs[d]["doc"], p, paths[(d, p)])
-
-            # 2) build concat list (first cue always starts at 0)
-            files = [paths[(d, p)] for _, d, p in cues]
-            starts = [0.0] + [t for t, _, _ in cues[1:]]
-            durs = [b - a for a, b in zip(starts, starts[1:])]
-            durs.append(max(length - starts[-1], 1) if length else 36000)
-
-            lst = os.path.join(tmp, "list.txt")
-            with open(lst, "w", encoding="utf-8") as f:
-                for p_, d_ in zip(files, durs):
-                    f.write(f"file '{p_.replace(os.sep, '/')}'\nduration {d_:.3f}\n")
-                f.write(f"file '{files[-1].replace(os.sep, '/')}'\n")  # concat quirk
-
-            # 3) ffmpeg
-            vf = (f"fps={fps},scale=1920:1080:force_original_aspect_ratio=decrease,"
-                  "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
-            if cuts:
-                keep = keep_segments(cuts, total)
-                if not keep:
-                    raise ValueError("Nothing is left of the audio after the cuts.")
-                maps = ["-filter_complex", build_cut_filter(vf, keep),
-                        "-map", "[v]", "-map", "[aout]"]
-            else:
-                maps = ["-vf", vf]
-            cmd = ([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-i", audio] + maps +
-                   ["-c:v", "libx264", "-tune", "stillimage", "-crf", str(crf),
-                    "-c:a", "aac", "-b:a", "96k", "-shortest",
-                    "-progress", "pipe:1", "-nostats", self.out.get()])
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, errors="replace", creationflags=NOWIN)
-            tail = []
-            for line in proc.stdout:
-                tail = (tail + [line.rstrip()])[-25:]
-                m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
-                if m and length:
-                    sec = int(m.group(1)) / 1e6
-                    self.ui(f"Encoding {fmt_time(sec)} / {fmt_time(length)}",
-                            min(sec / length * 100, 100))
-            proc.wait()
-            if proc.returncode == 0:
-                self.ui("Finished", 100, (True, f"Saved:\n{self.out.get()}"))
-            else:
-                self.ui("Failed", None, (False, "ffmpeg failed:\n" + "\n".join(tail)))
+            n, parts = len(jobs), []
+            for i, job in enumerate(jobs):
+                dest = self.out.get() if n == 1 else os.path.join(tmp, f"rec{i + 1}.mp4")
+                self.render(ffmpeg, job, tmp, dest, f"Record {i + 1}/{n}: " if n > 1 else "",
+                            fps, crf, i * 100 / n, 100 / n)
+                parts.append(dest)
+            if n > 1:
+                self.ui("Joining records…")
+                lst = os.path.join(tmp, "join.txt")
+                with open(lst, "w", encoding="utf-8") as f:
+                    for p_ in parts:
+                        f.write(f"file '{p_.replace(os.sep, '/')}'\n")
+                r = subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                                    "-c", "copy", self.out.get()], capture_output=True, text=True,
+                                   errors="replace", creationflags=NOWIN)
+                if r.returncode != 0:
+                    raise RuntimeError("Joining the records failed:\n" + r.stderr[-1500:])
+            self.ui("Finished", 100, (True, f"Saved:\n{self.out.get()}"))
         except Exception as e:
             self.ui("Failed", None, (False, str(e)))
         finally:
