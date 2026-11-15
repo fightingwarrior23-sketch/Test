@@ -16,7 +16,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python packages
-        run: pip install pymupdf==1.24.14 pyinstaller
+        run: pip install pymupdf==1.24.14 pyinstaller openpyxl
 
       - name: Download ffmpeg
         shell: pwsh
